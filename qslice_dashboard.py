@@ -290,6 +290,11 @@ btn_save = tk.Button(button_frame, text='Save Results & Chart', command=save_res
                     padx=20, pady=10, relief=tk.RAISED, bd=3, state='disabled')
 btn_save.grid(row=0, column=1, padx=10)
 
+btn_exit = tk.Button(button_frame, text='Exit', command=root.quit, 
+                    bg='#F44336', fg='white', font=("Arial", 11, "bold"), 
+                    padx=20, pady=10, relief=tk.RAISED, bd=3)
+btn_exit.grid(row=0, column=2, padx=10)
+
 # Results text box
 text_frame = tk.LabelFrame(root, text="Metric Explanations", font=("Arial", 11, "bold"),
                           bg='#f0f0f0', padx=10, pady=10)
