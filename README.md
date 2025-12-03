@@ -5,5 +5,5 @@ Q-SLICE v3 introduces user-driven configuration. Researchers can input custom va
 
 The dashboard version may require the installation of matplotlib to function. Also make sure qslice_threat_harness_v3.py is also in the same directory as the dashboard so it can be imported easily.
 
-Designed for both research and outreach, Q-SLICE outputs are interpretable, extensible, and thesis-ready. It supports examiner demonstration, post-quantum migration validation, and professional communication of quantum security risks. Whether evidencing algorithmic collapse, entropy corruption, or entanglement disruption, Q-SLICE provides a clear, actionable foundation for quantum threat modelling.
+Designed for both research and outreach, Q-SLICE outputs are interpretable, extensible and research ready. It supports examiner demonstration, post-quantum migration validation and professional communication of quantum security risks. Whether evidencing algorithmic collapse, entropy corruption, or entanglement disruption, Q-SLICE provides a clear, actionable foundation for quantum threat modelling.
 
