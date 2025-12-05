@@ -245,7 +245,7 @@ header_label = tk.Label(header_frame, text="Q-SLICE Threat Harness",
                         font=("Arial", 20, "bold"), fg="white", bg='#1976D2')
 header_label.pack(pady=10)
 
-subtitle = tk.Label(header_frame, text="Quantum Security Testing Framework with Visualization", 
+subtitle = tk.Label(header_frame, text="Quantum Threat Modelling Dashboard", 
                     font=("Arial", 10), fg="#E3F2FD", bg='#1976D2')
 subtitle.pack()
 
