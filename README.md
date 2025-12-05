@@ -7,3 +7,15 @@ The dashboard version may require the installation of matplotlib to function. Al
 
 Designed for both research and outreach, Q-SLICE outputs are interpretable, extensible and research ready. It supports examiner demonstration, post-quantum migration validation and professional communication of quantum security risks. Whether evidencing algorithmic collapse, entropy corruption, or entanglement disruption, Q-SLICE provides a clear, actionable foundation for quantum threat modelling.
 
+Instructions
+•	Install and run Miniconda: https://www.anaconda.com/download
+•	Create an environment: conda create --name quantum
+•	Activate environment: conda activate quantum
+•	Install PIP to install packages: conda install PIP
+•	Install QISKIT: Pip install Qiskit
+•	Type in cd .conda
+•	Download QSLICE Threat Harness and put into .conda directory which is usually in the  windows users directory.
+If you want to run dashboard version (qslice_dashboard) you will also need to:
+•	Type: pip install matplotlib
+
+
