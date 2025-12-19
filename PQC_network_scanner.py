@@ -16,6 +16,7 @@ from cryptography.hazmat.backends import default_backend
 @dataclass
 class CertAnalysis:
     host: str
+    hostname: Optional[str]
     port: int
     success: bool
     error: Optional[str]
@@ -51,12 +52,24 @@ def is_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
         return False
 
 
+def resolve_hostname(ip: str) -> Optional[str]:
+    """Resolve hostname from IP address."""
+    try:
+        hostname, _, _ = socket.gethostbyaddr(ip)
+        return hostname
+    except:
+        return None
+
+
 def analyze_certificate(host: str, port: int) -> CertAnalysis:
+    # Resolve hostname from IP
+    hostname = resolve_hostname(host)
+    
     try:
         der_cert = fetch_server_certificate(host, port)
     except Exception as e:
         return CertAnalysis(
-            host=host, port=port, success=False, error=str(e),
+            host=host, hostname=hostname, port=port, success=False, error=str(e),
             algo_family=None, key_size=None, quantum_vulnerable=None,
             severity=None, comment=None,
         )
@@ -100,7 +113,7 @@ def analyze_certificate(host: str, port: int) -> CertAnalysis:
             comment = "Non-RSA/EC key detected. Manual review required to determine quantum posture and conformance with NIST PQC guidance."
 
         return CertAnalysis(
-            host=host, port=port, success=True, error=None,
+            host=host, hostname=hostname, port=port, success=True, error=None,
             algo_family=algo_family, key_size=key_size,
             quantum_vulnerable=quantum_vulnerable, severity=severity,
             comment=comment,
@@ -108,7 +121,7 @@ def analyze_certificate(host: str, port: int) -> CertAnalysis:
 
     except Exception as e:
         return CertAnalysis(
-            host=host, port=port, success=False,
+            host=host, hostname=hostname, port=port, success=False,
             error=f"Certificate parse error: {e}",
             algo_family=None, key_size=None, quantum_vulnerable=None,
             severity=None, comment=None,
@@ -170,7 +183,11 @@ def format_report(results: List[CertAnalysis]) -> str:
     total_vulnerable = 0
 
     for r in results:
-        output += f"Target: {r.host}:{r.port}\n"
+        # Display IP and hostname (if resolved)
+        target_info = f"{r.host}:{r.port}"
+        if r.hostname:
+            target_info += f" ({r.hostname})"
+        output += f"Target: {target_info}\n"
         if not r.success:
             output += "  Status      : ERROR\n"
             output += f"  Detail      : {r.error}\n\n"
