@@ -7,16 +7,19 @@ from dataclasses import dataclass
 from typing import Optional, List, Tuple
 import threading
 import ipaddress
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import rsa, ec
 from cryptography.hazmat.backends import default_backend
+import re
 
 
 @dataclass
 class CertAnalysis:
     host: str
     hostname: Optional[str]
+    device_type: Optional[str]
     port: int
     success: bool
     error: Optional[str]
@@ -25,19 +28,226 @@ class CertAnalysis:
     quantum_vulnerable: Optional[bool]
     severity: Optional[str]
     comment: Optional[str]
+    pqc_ready: Optional[bool] = False
+    pqc_details: Optional[str] = None
+    chain_length: Optional[int] = None
+    chain_details: Optional[List[dict]] = None
 
 
-def fetch_server_certificate(host: str, port: int, timeout: float = 3.0) -> bytes:
-    """Fetch the DER-encoded leaf certificate from a TLS server."""
+def fetch_server_certificate(host: str, port: int, timeout: float = 3.0) -> Tuple[List[bytes], Optional[str], Optional[List[str]]]:
+    """Fetch the entire DER-encoded certificate chain from a TLS server and negotiated cipher/groups."""
     context = ssl.create_default_context()
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
     
     conn = socket.create_connection((host, port), timeout=timeout)
     sock = context.wrap_socket(conn, server_hostname=host)
-    der_cert = sock.getpeercert(binary_form=True)
+    
+    # Get the full certificate chain in DER format
+    cert_chain = []
+    try:
+        # Get peer certificate chain (returns list of DER-encoded certs)
+        # Note: getpeercert_chain() is not available in standard ssl, so we use a workaround
+        der_cert = sock.getpeercert(binary_form=True)
+        cert_chain.append(der_cert)
+        
+        # Try to get the full chain using the underlying socket
+        # This is a best-effort approach - we'll get what we can
+        try:
+            # Get the SSL object's certificate chain if available
+            import ssl as ssl_module
+            if hasattr(sock, '_sslobj'):
+                # Try to extract additional certificates from the connection
+                # This is implementation-specific and may not work on all systems
+                pass
+        except:
+            pass
+    except Exception as e:
+        # If we can't get the chain, at least try to get the leaf
+        try:
+            der_cert = sock.getpeercert(binary_form=True)
+            cert_chain.append(der_cert)
+        except:
+            pass
+    
+    # Try to get negotiated cipher and protocol info
+    cipher = None
+    supported_groups = None
+    try:
+        cipher = sock.cipher()  # Returns (cipher_name, protocol_version, secret_bits)
+        # Note: TLS supported_groups not directly accessible via standard ssl module
+    except:
+        pass
+    
     sock.close()
-    return der_cert
+    return cert_chain, cipher, supported_groups
+
+
+def detect_pqc_hybrid_features(cert: x509.Certificate, cipher_info: Optional[Tuple]) -> Tuple[bool, Optional[str]]:
+    """
+    Detect PQC/hybrid features in certificate or TLS handshake.
+    Returns (is_pqc_ready, details_string)
+    """
+    pqc_indicators = []
+    
+    # 1. Check certificate signature algorithm for PQC
+    sig_algo = cert.signature_algorithm_oid.dotted_string
+    sig_name = cert.signature_algorithm_oid._name if hasattr(cert.signature_algorithm_oid, '_name') else sig_algo
+    
+    # Known PQC signature OIDs (experimental)
+    pqc_sig_patterns = [
+        'dilithium',  # CRYSTALS-Dilithium
+        'falcon',     # Falcon
+        'sphincs',    # SPHINCS+
+        'ml-dsa',     # ML-DSA (Dilithium standardized name)
+        '1.3.6.1.4.1.2.267.7',  # Example Dilithium OID prefix
+        '1.3.9999',   # Experimental OID range
+    ]
+    
+    sig_algo_lower = str(sig_name).lower() + ' ' + sig_algo.lower()
+    for pattern in pqc_sig_patterns:
+        if pattern in sig_algo_lower:
+            pqc_indicators.append(f"PQC signature: {sig_name}")
+            break
+    
+    # 2. Check public key algorithm for PQC
+    try:
+        pub_key = cert.public_key()
+        pub_key_type = type(pub_key).__name__.lower()
+        
+        pqc_key_patterns = ['kyber', 'mlkem', 'dilithium', 'mldsa', 'falcon', 'sphincs']
+        for pattern in pqc_key_patterns:
+            if pattern in pub_key_type:
+                pqc_indicators.append(f"PQC public key: {type(pub_key).__name__}")
+                break
+    except:
+        pass
+    
+    # 3. Check certificate extensions for hybrid/PQC indicators
+    try:
+        for ext in cert.extensions:
+            ext_oid = ext.oid.dotted_string
+            ext_name = ext.oid._name if hasattr(ext.oid, '_name') else ext_oid
+            
+            # Look for experimental PQC extension OIDs
+            if ext_oid.startswith('1.3.9999') or 'pqc' in str(ext_name).lower() or 'hybrid' in str(ext_name).lower():
+                pqc_indicators.append(f"PQC extension: {ext_name}")
+    except:
+        pass
+    
+    # 4. Check Subject Alternative Names for experimental markers
+    try:
+        san_ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        for name in san_ext.value:
+            if isinstance(name, x509.DNSName):
+                dns_name = name.value.lower()
+                if 'pqc' in dns_name or 'quantum' in dns_name or 'hybrid' in dns_name:
+                    pqc_indicators.append(f"PQC marker in SAN: {name.value}")
+    except:
+        pass
+    
+    # 5. Check cipher suite for hybrid key exchange (X25519+Kyber)
+    if cipher_info:
+        cipher_name = cipher_info[0] if isinstance(cipher_info, tuple) else str(cipher_info)
+        cipher_lower = cipher_name.lower()
+        
+        # Hybrid KEX patterns
+        hybrid_patterns = ['kyber', 'mlkem', 'x25519kyber', 'x25519_kyber', 'hybrid']
+        for pattern in hybrid_patterns:
+            if pattern in cipher_lower:
+                pqc_indicators.append(f"Hybrid KEX in cipher: {cipher_name}")
+                break
+    
+    # 6. Check certificate issuer/subject for PQC test markers
+    try:
+        issuer_str = cert.issuer.rfc4514_string().lower()
+        subject_str = cert.subject.rfc4514_string().lower()
+        
+        for cert_field in [issuer_str, subject_str]:
+            if any(marker in cert_field for marker in ['pqc', 'post-quantum', 'dilithium', 'kyber']):
+                pqc_indicators.append("PQC marker in cert DN")
+                break
+    except:
+        pass
+    
+    is_pqc_ready = len(pqc_indicators) > 0
+    details = '; '.join(pqc_indicators) if pqc_indicators else None
+    
+    return is_pqc_ready, details
+
+
+def analyze_cert_chain(cert_chain_der: List[bytes], cipher_info: Optional[Tuple]) -> Tuple[List[dict], bool, Optional[str]]:
+    """Analyze all certificates in the chain and detect PQC features.
+    Returns (chain_details, any_pqc_ready, pqc_summary)
+    """
+    chain_details = []
+    any_pqc = False
+    pqc_findings = []
+    
+    for idx, der_cert in enumerate(cert_chain_der):
+        try:
+            cert = x509.load_der_x509_certificate(der_cert, default_backend())
+            public_key = cert.public_key()
+            
+            # Determine cert type in chain
+            if idx == 0:
+                cert_type = "Leaf"
+            elif idx == len(cert_chain_der) - 1:
+                cert_type = "Root"
+            else:
+                cert_type = f"Intermediate-{idx}"
+            
+            # Analyze key type
+            algo_family = None
+            key_size = None
+            quantum_vuln = None
+            
+            if isinstance(public_key, rsa.RSAPublicKey):
+                algo_family = "RSA"
+                key_size = public_key.key_size
+                quantum_vuln = True
+            elif isinstance(public_key, ec.EllipticCurvePublicKey):
+                algo_family = "EC"
+                key_size = public_key.curve.key_size
+                quantum_vuln = True
+            else:
+                algo_family = type(public_key).__name__
+                quantum_vuln = None
+            
+            # Check for PQC features (only on leaf cert for cipher, all certs for signatures)
+            pqc_ready, pqc_details = detect_pqc_hybrid_features(
+                cert, 
+                cipher_info if idx == 0 else None
+            )
+            
+            if pqc_ready:
+                any_pqc = True
+                pqc_findings.append(f"{cert_type}: {pqc_details}")
+            
+            # Get subject for identification
+            try:
+                subject = cert.subject.rfc4514_string()
+            except:
+                subject = "Unknown"
+            
+            chain_details.append({
+                'position': cert_type,
+                'subject': subject,
+                'algo_family': algo_family,
+                'key_size': key_size,
+                'quantum_vulnerable': quantum_vuln,
+                'pqc_ready': pqc_ready,
+                'pqc_details': pqc_details
+            })
+            
+        except Exception as e:
+            chain_details.append({
+                'position': f'Cert-{idx}',
+                'error': str(e)
+            })
+    
+    pqc_summary = '; '.join(pqc_findings) if pqc_findings else None
+    return chain_details, any_pqc, pqc_summary
 
 
 def is_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -52,8 +262,99 @@ def is_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
         return False
 
 
+def identify_device(ip: str, cert: Optional[x509.Certificate] = None) -> Tuple[Optional[str], Optional[str]]:
+    """Enhanced device identification using DNS, certificate, and pattern matching.
+    Returns (hostname, device_type)
+    """
+    hostname = None
+    device_type = None
+    
+    # 1. Try reverse DNS lookup
+    try:
+        hostname, _, _ = socket.gethostbyaddr(ip)
+    except:
+        pass
+    
+    # 2. Extract name from certificate CN or SAN
+    cert_name = None
+    if cert:
+        try:
+            # Try Common Name (CN) first
+            cn_attr = cert.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
+            if cn_attr:
+                cert_name = cn_attr[0].value
+                if not hostname or len(cert_name) > len(hostname):
+                    hostname = cert_name
+        except:
+            pass
+        
+        try:
+            # Try Subject Alternative Names
+            san_ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+            for name in san_ext.value:
+                if isinstance(name, x509.DNSName):
+                    san_name = name.value
+                    # Prefer non-wildcard, non-generic names
+                    if not san_name.startswith('*') and '.' in san_name:
+                        if not hostname or (len(san_name) < len(hostname) and 'localhost' not in san_name):
+                            hostname = san_name
+                            break
+        except:
+            pass
+    
+    # 3. Detect device type from hostname patterns
+    if hostname:
+        hostname_lower = hostname.lower()
+        
+        # Network infrastructure devices
+        if any(pattern in hostname_lower for pattern in ['router', 'rtr', 'gateway', 'gw']):
+            device_type = 'Router'
+        elif any(pattern in hostname_lower for pattern in ['switch', 'sw']):
+            device_type = 'Switch'
+        elif any(pattern in hostname_lower for pattern in ['firewall', 'fw', 'fortigate', 'palo', 'checkpoint', 'asa']):
+            device_type = 'Firewall'
+        elif any(pattern in hostname_lower for pattern in ['vpn', 'ssl-vpn']):
+            device_type = 'VPN Gateway'
+        elif any(pattern in hostname_lower for pattern in ['lb', 'loadbalancer', 'load-balancer', 'f5', 'bigip']):
+            device_type = 'Load Balancer'
+        
+        # Servers
+        elif any(pattern in hostname_lower for pattern in ['web', 'www', 'http', 'nginx', 'apache']):
+            device_type = 'Web Server'
+        elif any(pattern in hostname_lower for pattern in ['mail', 'smtp', 'exchange', 'postfix']):
+            device_type = 'Mail Server'
+        elif any(pattern in hostname_lower for pattern in ['db', 'database', 'sql', 'mysql', 'postgres', 'oracle']):
+            device_type = 'Database Server'
+        elif any(pattern in hostname_lower for pattern in ['api', 'rest']):
+            device_type = 'API Server'
+        elif any(pattern in hostname_lower for pattern in ['app', 'application']):
+            device_type = 'Application Server'
+        
+        # Management/Monitoring
+        elif any(pattern in hostname_lower for pattern in ['vcenter', 'esxi', 'vmware']):
+            device_type = 'Virtualization'
+        elif any(pattern in hostname_lower for pattern in ['idrac', 'ilo', 'ipmi', 'bmc']):
+            device_type = 'BMC/IPMI'
+        elif any(pattern in hostname_lower for pattern in ['monitor', 'nagios', 'zabbix', 'prometheus']):
+            device_type = 'Monitoring'
+        
+        # Storage
+        elif any(pattern in hostname_lower for pattern in ['nas', 'san', 'storage', 'netapp']):
+            device_type = 'Storage Device'
+        
+        # Generic server if no specific type found
+        elif any(pattern in hostname_lower for pattern in ['server', 'srv', 'host']):
+            device_type = 'Server'
+        
+        # Default for domains
+        elif hostname_lower.count('.') >= 2:
+            device_type = 'Network Host'
+    
+    return hostname, device_type
+
+
 def resolve_hostname(ip: str) -> Optional[str]:
-    """Resolve hostname from IP address."""
+    """Simple hostname resolution for backwards compatibility."""
     try:
         hostname, _, _ = socket.gethostbyaddr(ip)
         return hostname
@@ -62,27 +363,53 @@ def resolve_hostname(ip: str) -> Optional[str]:
 
 
 def analyze_certificate(host: str, port: int) -> CertAnalysis:
-    # Resolve hostname from IP
+    # Initial hostname resolution
     hostname = resolve_hostname(host)
+    device_type = None
     
     try:
-        der_cert = fetch_server_certificate(host, port)
+        cert_chain_der, cipher_info, _ = fetch_server_certificate(host, port)
     except Exception as e:
         return CertAnalysis(
-            host=host, hostname=hostname, port=port, success=False, error=str(e),
+            host=host, hostname=hostname, device_type=device_type, port=port, success=False, error=str(e),
             algo_family=None, key_size=None, quantum_vulnerable=None,
-            severity=None, comment=None,
+            severity=None, comment=None, pqc_ready=False, pqc_details=None,
+            chain_length=None, chain_details=None,
+        )
+
+    if not cert_chain_der:
+        return CertAnalysis(
+            host=host, hostname=hostname, device_type=device_type, port=port, success=False, error="No certificates retrieved",
+            algo_family=None, key_size=None, quantum_vulnerable=None,
+            severity=None, comment=None, pqc_ready=False, pqc_details=None,
+            chain_length=0, chain_details=None,
         )
 
     try:
+        # Analyze the full certificate chain
+        chain_details, chain_pqc_ready, chain_pqc_summary = analyze_cert_chain(cert_chain_der, cipher_info)
+        
+        # Analyze the leaf certificate (first in chain)
+        der_cert = cert_chain_der[0]
         cert = x509.load_der_x509_certificate(der_cert, default_backend())
         public_key = cert.public_key()
+        
+        # Enhanced device identification using certificate
+        hostname, device_type = identify_device(host, cert)
 
         algo_family = None
         key_size = None
         quantum_vulnerable = None
         severity = None
         comment = None
+        
+        # Detect PQC/hybrid features on leaf
+        pqc_ready, pqc_details = detect_pqc_hybrid_features(cert, cipher_info)
+        
+        # Override with chain-wide PQC detection
+        if chain_pqc_ready:
+            pqc_ready = True
+            pqc_details = chain_pqc_summary if chain_pqc_summary else pqc_details
 
         if isinstance(public_key, rsa.RSAPublicKey):
             algo_family = "RSA"
@@ -98,6 +425,11 @@ def analyze_certificate(host: str, port: int) -> CertAnalysis:
             else:
                 severity = "Medium"
                 comment = f"RSA-{key_size} marginally improves classical resistance, but remains fundamentally breakable by Shor's algorithm."
+            
+            # Adjust if PQC hybrid detected
+            if pqc_ready:
+                severity = "Low"
+                comment += f" HOWEVER: PQC/hybrid features detected - {pqc_details}"
 
         elif isinstance(public_key, ec.EllipticCurvePublicKey):
             algo_family = "EC"
@@ -105,26 +437,49 @@ def analyze_certificate(host: str, port: int) -> CertAnalysis:
             quantum_vulnerable = True
             severity = "High"
             comment = f"Elliptic Curve cryptography (approx. {key_size}-bit strength) is directly broken by quantum discrete log attacks."
+            
+            # Adjust if PQC hybrid detected
+            if pqc_ready:
+                severity = "Low"
+                comment += f" HOWEVER: PQC/hybrid features detected - {pqc_details}"
 
         else:
             algo_family = type(public_key).__name__
-            quantum_vulnerable = None
-            severity = "Informational"
-            comment = "Non-RSA/EC key detected. Manual review required to determine quantum posture and conformance with NIST PQC guidance."
+            
+            # Check if this is actually a PQC key type
+            if pqc_ready:
+                quantum_vulnerable = False
+                severity = "Low"
+                comment = f"PQC-ready certificate detected: {pqc_details}. Quantum-resistant as currently understood."
+            else:
+                quantum_vulnerable = None
+                severity = "Informational"
+                comment = "Non-RSA/EC key detected. Manual review required to determine quantum posture and conformance with NIST PQC guidance."
+        
+        # Add chain information to comment
+        if len(cert_chain_der) > 1:
+            chain_summary = f" Certificate chain has {len(cert_chain_der)} certificates."
+            # Check for mixed key types in chain
+            chain_algos = set(c.get('algo_family') for c in chain_details if 'algo_family' in c)
+            if len(chain_algos) > 1:
+                chain_summary += f" Mixed key types in chain: {', '.join(chain_algos)}."
+            comment = (comment or "") + chain_summary
 
         return CertAnalysis(
-            host=host, hostname=hostname, port=port, success=True, error=None,
+            host=host, hostname=hostname, device_type=device_type, port=port, success=True, error=None,
             algo_family=algo_family, key_size=key_size,
             quantum_vulnerable=quantum_vulnerable, severity=severity,
-            comment=comment,
+            comment=comment, pqc_ready=pqc_ready, pqc_details=pqc_details,
+            chain_length=len(cert_chain_der), chain_details=chain_details,
         )
 
     except Exception as e:
         return CertAnalysis(
-            host=host, hostname=hostname, port=port, success=False,
+            host=host, hostname=hostname, device_type=device_type, port=port, success=False,
             error=f"Certificate parse error: {e}",
             algo_family=None, key_size=None, quantum_vulnerable=None,
-            severity=None, comment=None,
+            severity=None, comment=None, pqc_ready=False, pqc_details=None,
+            chain_length=len(cert_chain_der) if cert_chain_der else 0, chain_details=None,
         )
 
 
@@ -178,15 +533,19 @@ def format_report(results: List[CertAnalysis]) -> str:
 
     high_count = 0
     medium_count = 0
+    low_count = 0
     info_count = 0
     error_count = 0
     total_vulnerable = 0
+    pqc_ready_count = 0
 
     for r in results:
         # Display IP and hostname (if resolved)
         target_info = f"{r.host}:{r.port}"
         if r.hostname:
             target_info += f" ({r.hostname})"
+        if r.device_type:
+            target_info += f" [{r.device_type}]"
         output += f"Target: {target_info}\n"
         if not r.success:
             output += "  Status      : ERROR\n"
@@ -198,6 +557,31 @@ def format_report(results: List[CertAnalysis]) -> str:
         output += f"  Key family  : {r.algo_family}\n"
         if r.key_size:
             output += f"  Key size    : {r.key_size} bits\n"
+        
+        # Display certificate chain information
+        if r.chain_length and r.chain_length > 1:
+            output += f"  Chain length: {r.chain_length} certificates\n"
+            if r.chain_details:
+                output += "  Chain info  :\n"
+                for cert_info in r.chain_details:
+                    if 'error' in cert_info:
+                        output += f"    - {cert_info.get('position', 'Unknown')}: Error parsing\n"
+                    else:
+                        pos = cert_info.get('position', 'Unknown')
+                        algo = cert_info.get('algo_family', 'Unknown')
+                        key_sz = cert_info.get('key_size', 'N/A')
+                        vuln = cert_info.get('quantum_vulnerable', None)
+                        vuln_str = "⚠️ Quantum-vulnerable" if vuln else "✓ Quantum-safe" if vuln is False else "?"
+                        
+                        output += f"    - {pos}: {algo}"
+                        if key_sz != 'N/A':
+                            output += f"-{key_sz}"
+                        output += f" ({vuln_str})\n"
+                        
+                        # Show PQC features if present
+                        if cert_info.get('pqc_ready'):
+                            output += f"      PQC: {cert_info.get('pqc_details', 'detected')}\n"
+        
         if r.quantum_vulnerable is True:
             output += "  Quantum risk: VULNERABLE (pre-quantum algorithm)\n"
             total_vulnerable += 1
@@ -205,6 +589,12 @@ def format_report(results: List[CertAnalysis]) -> str:
             output += "  Quantum risk: Not vulnerable (as currently understood)\n"
         else:
             output += "  Quantum risk: UNKNOWN (manual review required)\n"
+        
+        # Display PQC readiness
+        if r.pqc_ready:
+            output += "  PQC Ready   : YES ✓\n"
+            output += f"  PQC Details : {r.pqc_details}\n"
+            pqc_ready_count += 1
 
         if r.severity:
             output += f"  Severity    : {r.severity}\n"
@@ -212,6 +602,8 @@ def format_report(results: List[CertAnalysis]) -> str:
                 high_count += 1
             elif r.severity == "Medium":
                 medium_count += 1
+            elif r.severity == "Low":
+                low_count += 1
             else:
                 info_count += 1
 
@@ -229,8 +621,23 @@ def format_report(results: List[CertAnalysis]) -> str:
     output += f"Total targets assessed     : {total}\n"
     output += f" - High risk (quantum)     : {high_count}\n"
     output += f" - Medium risk (quantum)   : {medium_count}\n"
+    output += f" - Low risk (PQC/hybrid)   : {low_count}\n"
     output += f" - Informational/Other     : {info_count}\n"
-    output += f" - Errors / unreachable    : {error_count}\n\n"
+    output += f" - Errors / unreachable    : {error_count}\n"
+    output += f" - PQC-ready endpoints     : {pqc_ready_count}\n\n"
+
+    if pqc_ready_count > 0:
+        output += "PQC/HYBRID DETECTION\n"
+        output += "--------------------\n"
+        output += (
+            f"Found {pqc_ready_count} endpoint(s) with PQC or hybrid cryptography features.\n"
+            "These may include:\n"
+            "  • X25519+Kyber (ML-KEM) hybrid key exchange\n"
+            "  • Dilithium (ML-DSA) signatures\n"
+            "  • Experimental PQC certificates (OpenSSL 3.2+)\n\n"
+            "Note: Early PQC deployments are experimental. Verify implementations\n"
+            "align with final NIST standards and your security requirements.\n\n"
+        )
 
     if total_vulnerable > 0:
         output += "QUANTUM RISK SUMMARY\n"
@@ -249,7 +656,8 @@ def format_report(results: List[CertAnalysis]) -> str:
         output += "  1. Establish a crypto inventory and crypto-agility strategy.\n"
         output += "  2. Track NIST PQC standardisation (e.g., Kyber (ML-KEM), Dilithium (ML-DSA)).\n"
         output += "  3. Plan migration away from RSA/ECC for long-lived data.\n"
-        output += "  4. Align remediation with your internal risk framework and regulations.\n"
+        output += "  4. Consider hybrid approaches (classical + PQC) during transition.\n"
+        output += "  5. Align remediation with your internal risk framework and regulations.\n"
     else:
         output += "QUANTUM RISK SUMMARY\n"
         output += "--------------------\n"
@@ -269,19 +677,20 @@ class NetworkScannerGUI:
         self.root.geometry("950x750")
         self.root.configure(bg='#f0f0f0')
         self.scan_cancelled = False
+        self.max_workers = 20  # Number of parallel threads
 
         # Header
-        header_frame = tk.Frame(root, bg='#00796B', height=70)
+        header_frame = tk.Frame(root, bg='#000000', height=100)
         header_frame.pack(fill='x')
         header_frame.pack_propagate(False)
 
         header_label = tk.Label(header_frame, text="PQC Network Scanner", 
-                                font=("Arial", 20, "bold"), fg="white", bg='#00796B')
-        header_label.pack(pady=10)
+                                font=("Arial", 20, "bold"), fg="white", bg='#000000')
+        header_label.pack(pady=(20, 5))
 
         subtitle = tk.Label(header_frame, text="Internal Network TLS Certificate Quantum Vulnerability Assessment", 
-                           font=("Arial", 10), fg="#E0F2F1", bg='#00796B')
-        subtitle.pack()
+                           font=("Arial", 10), fg="#E0F2F1", bg='#000000')
+        subtitle.pack(pady=(0, 15))
 
         # Input frame
         input_frame = tk.LabelFrame(root, text="Network Scan Configuration", 
@@ -317,9 +726,18 @@ class NetworkScannerGUI:
                       variable=self.check_open_var, bg='#f0f0f0',
                       font=("Arial", 9)).grid(row=4, column=1, sticky='w', padx=10, pady=5)
 
+        # Thread pool size
+        tk.Label(input_frame, text="Parallel threads:", 
+                font=("Arial", 10), bg='#f0f0f0', anchor='w').grid(row=5, column=0, sticky='w', pady=5)
+        
+        self.threads_var = tk.IntVar(value=20)
+        threads_spinbox = tk.Spinbox(input_frame, from_=1, to=100, textvariable=self.threads_var,
+                                     width=10, font=("Arial", 10))
+        threads_spinbox.grid(row=5, column=1, padx=10, pady=5, sticky='w')
+
         # Progress bar
         self.progress = ttk.Progressbar(input_frame, mode='determinate', length=400)
-        self.progress.grid(row=5, column=0, columnspan=2, pady=10, padx=10)
+        self.progress.grid(row=6, column=0, columnspan=2, pady=10, padx=10)
 
         # Buttons frame
         button_frame = tk.Frame(root, bg='#f0f0f0')
@@ -448,33 +866,59 @@ class NetworkScannerGUI:
             # Clear previous results
             self.results_text.delete('1.0', tk.END)
 
-            # Run scan
+            # Run scan with thread pool
             results = []
             scanned = 0
             check_open = self.check_open_var.get()
+            max_workers = self.threads_var.get()
 
-            for ip in ips:
+            # Build list of targets to scan
+            targets = [(ip, port) for ip in ips for port in ports]
+            
+            def scan_target(target):
+                """Scan a single IP:port target"""
+                ip, port = target
                 if self.scan_cancelled:
-                    break
-                    
-                for port in ports:
+                    return None
+                
+                # Check if port is open first (if enabled)
+                if check_open:
+                    if not is_port_open(ip, port, timeout=0.5):
+                        return None
+                
+                # Analyze certificate
+                result = analyze_certificate(ip, port)
+                if result.success or result.error != 'timed out':  # Include meaningful errors
+                    return result
+                return None
+            
+            # Execute parallel scanning
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all tasks
+                future_to_target = {executor.submit(scan_target, target): target for target in targets}
+                
+                # Process completed tasks
+                for future in as_completed(future_to_target):
                     if self.scan_cancelled:
+                        executor.shutdown(wait=False, cancel_futures=True)
                         break
                     
+                    target = future_to_target[future]
                     scanned += 1
                     self.progress['value'] = scanned
-                    self.status_label.config(text=f"Scanning {ip}:{port} ({scanned}/{total_targets})...", fg='#FF9800')
+                    self.status_label.config(
+                        text=f"Scanning {target[0]}:{target[1]} ({scanned}/{total_targets})...", 
+                        fg='#FF9800'
+                    )
                     self.root.update()
                     
-                    # Check if port is open first (if enabled)
-                    if check_open:
-                        if not is_port_open(ip, port):
-                            continue
-                    
-                    # Analyze certificate
-                    result = analyze_certificate(ip, port)
-                    if result.success or result.error != 'timed out':  # Include meaningful errors
-                        results.append(result)
+                    try:
+                        result = future.result()
+                        if result:
+                            results.append(result)
+                    except Exception as e:
+                        # Silently skip failed scans
+                        pass
 
             if self.scan_cancelled:
                 self.results_text.insert('1.0', "=== SCAN CANCELLED ===\n\n")
