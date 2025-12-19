@@ -12,8 +12,6 @@ Install and run Miniconda: https://www.anaconda.com/download. Create an environm
 
 If you want to run dashboard version (qslice_dashboard) you will also need to type: pip install matplotlib
 
-PQC_scanner.py is a qauantum readiness scanner that assesses TLS certificates for quantum-vulnerable cryptography. It retrieves certificates from HTTPS endpoints, identifies RSA, ECC, or other key types and provides an exportable report highlighting quantum risk exposure. The tool is suitable for demonstrations, workshops and early-stage PQC readiness assessments. Use the Quantum Readiness Scanner User guide for instructions on how to use and install.
-
-There is also a network scanner where you input IP range and ports for use on internal networks. 
+If you want to run the Q-SLICE Threat Harness on an IBM Quantum Cloud computer use QSLICE_Threat_Harnessv4 you will just need to use your API key for it to run.
 
 
