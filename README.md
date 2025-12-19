@@ -12,4 +12,6 @@ Install and run Miniconda: https://www.anaconda.com/download. Create an environm
 
 If you want to run dashboard version (qslice_dashboard) you will also need to type: pip install matplotlib
 
+Ther is also a PQC Scanner PQC_scanner.py is a qauantum readiness scanner that assesses TLS certificates for quantum-vulnerable cryptography. It retrieves certificates from HTTPS endpoints, identifies RSA, ECC, or other key types and provides an exportable report highlighting quantum risk exposure. The tool is suitable for demonstrations, workshops and early-stage PQC readiness assessments.
+
 
