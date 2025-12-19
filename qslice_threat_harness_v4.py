@@ -8,15 +8,27 @@ import numpy as np, random
 from qiskit_ibm_runtime import QiskitRuntimeService
 
 # Initialize service
+service = None
 try:
     service = QiskitRuntimeService(channel="ibm_quantum_platform")
+    print("[INFO] Using saved IBM Quantum credentials")
 except Exception as e:
-    print(f"[ERROR] IBM Quantum account not configured: {e}")
-    print("\nTo save your account, run:")
-    print("  from qiskit_ibm_runtime import QiskitRuntimeService")
-    print("  QiskitRuntimeService.save_account(channel='ibm_quantum_platform', token='YOUR_IBM_TOKEN')")
-    print("\nGet your token from: https://quantum.ibm.com/")
-    raise
+    print(f"[INFO] IBM Quantum account not configured: {e}")
+    print("\nPlease enter your IBM Quantum API key.")
+    print("Get your key from: https://quantum.ibm.com/")
+    api_key = input("Enter API key (or press Enter to skip): ").strip()
+    
+    if api_key:
+        try:
+            QiskitRuntimeService.save_account(channel='ibm_quantum_platform', token=api_key, overwrite=True)
+            service = QiskitRuntimeService(channel="ibm_quantum_platform")
+            print("[INFO] API key saved successfully!")
+        except Exception as e2:
+            print(f"[ERROR] Failed to save API key: {e2}")
+            raise
+    else:
+        print("[ERROR] No API key provided. Cannot proceed.")
+        raise ValueError("IBM Quantum API key required")
 
 # Choose backends
 BACKEND_QASM = service.backend('ibmq_qasm_simulator')
